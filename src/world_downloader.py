@@ -16,6 +16,22 @@ class AESCipher:
     def decrypt(self, data):
         return self.decryptor.decrypt(data)
 
+class BufferedSocket:
+    def __init__(self, sock):
+        self.sock = sock
+        self.buffer = b''
+
+    def recv(self, length):
+        while len(self.buffer) < length:
+            data = self.sock.recv(4096)
+            if not data:
+                return None
+            self.buffer += data
+
+        result = self.buffer[:length]
+        self.buffer = self.buffer[length:]
+        return result
+
 import argparse
 import json
 import os
@@ -28,6 +44,8 @@ import nbtlib
 import zlib
 import time
 import hashlib
+import struct
+import dns.resolver
 
 def java_hex_digest(data):
     sha1 = hashlib.sha1()
@@ -145,6 +163,9 @@ def get_default_minecraft_path():
         return Path(".minecraft")
 
 def read_fully(sock, length):
+    if isinstance(sock, BufferedSocket):
+        return sock.recv(length)
+
     data = b''
     while len(data) < length:
         chunk = sock.recv(length - len(data))
@@ -170,6 +191,9 @@ def read_varint(stream):
         result |= value << (7 * num_read)
         num_read += 1
 
+        if num_read > 5:
+            raise ValueError("VarInt is too big")
+
         if (byte & 0b10000000) == 0:
             break
 
@@ -181,20 +205,13 @@ class Packet:
         self.data = data
 
     @classmethod
-    def read_packet(cls, sock, compression_threshold=-1, cipher=None):
-        if cipher:
-            # We can't know the length of the encrypted packet, so we just read
-            data = sock.recv(4096)
-            if not data:
-                return None
-            data = cipher.decrypt(data)
-        else:
-            packet_length = read_varint(sock)
-            if packet_length is None:
-                return None
-            data = read_fully(sock, packet_length)
-            if data is None:
-                return None
+    def read_packet(cls, sock, compression_threshold=-1):
+        packet_length = read_varint(sock)
+        if packet_length is None:
+            return None
+        data = read_fully(sock, packet_length)
+        if data is None:
+            return None
 
         data_io = io.BytesIO(data)
 
@@ -220,16 +237,75 @@ class Connection:
         self.client_cipher = None
         self.server_cipher = None
 
+    def read_varint_from_buffer(self, buffer):
+        result = 0
+        num_read = 0
+        while True:
+            if num_read >= len(buffer):
+                return None, 0
+
+            byte = buffer[num_read]
+            value = byte & 0b01111111
+            result |= value << (7 * num_read)
+            num_read += 1
+
+            if num_read > 5:
+                raise ValueError("VarInt is too big")
+
+            if (byte & 0b10000000) == 0:
+                break
+        return result, num_read
+
+    def _process_buffer(self, buffer, direction, dest_socket):
+        while True:
+            packet_length, varint_len = self.read_varint_from_buffer(buffer)
+
+            if packet_length is None:
+                break
+
+            if len(buffer) < varint_len + packet_length:
+                break
+
+            packet_body = buffer[varint_len : varint_len + packet_length]
+            buffer = buffer[varint_len + packet_length:]
+
+            data_io = io.BytesIO(packet_body)
+
+            if self.compression_threshold != -1:
+                data_length = read_varint(data_io)
+                if data_length != 0:
+                    data = zlib.decompress(data_io.read())
+                else:
+                    data = data_io.read()
+                data_io = io.BytesIO(data)
+
+            packet_id = read_varint(data_io)
+            packet = Packet(packet_id, data_io.read())
+
+            self.handle_packet(packet, direction, dest_socket)
+
+        return buffer
+
     def forward_data(self, source_socket, dest_socket, direction):
+        buffer = b''
         try:
             while True:
                 cipher = self.client_cipher if direction == "Server -> Client" else self.server_cipher
 
-                packet = Packet.read_packet(source_socket, self.compression_threshold, cipher)
-                if packet is None:
-                    break
+                if cipher:
+                    raw_socket = source_socket.sock if isinstance(source_socket, BufferedSocket) else source_socket
 
-                self.handle_packet(packet, direction, dest_socket)
+                    encrypted_data = raw_socket.recv(4096)
+                    if not encrypted_data:
+                        break
+
+                    buffer += cipher.decrypt(encrypted_data)
+                    buffer = self._process_buffer(buffer, direction, dest_socket)
+                else:
+                    packet = Packet.read_packet(source_socket, self.compression_threshold)
+                    if packet is None:
+                        break
+                    self.handle_packet(packet, direction, dest_socket)
 
         except (ConnectionResetError, BrokenPipeError):
             print(f"[{direction}] Connection closed.")
@@ -318,6 +394,9 @@ class Connection:
 
                 self.client_cipher = AESCipher(shared_secret)
                 self.server_cipher = AESCipher(shared_secret)
+
+                self.client_socket = BufferedSocket(self.client_socket)
+                self.remote_socket = BufferedSocket(self.remote_socket)
                 return
 
             elif direction == "Server -> Client" and packet.id == 0x03: # Set Compression
@@ -325,6 +404,17 @@ class Connection:
             elif direction == "Server -> Client" and packet.id == 0x02: # Login Success
                 self.state = "GAME"
         elif self.state == "GAME":
+            if self.args.disable_world_gen and direction == "Server -> Client" and packet.id == 0x36:
+                # Player Position and Look
+                x, y, z, yaw, pitch, flags, teleport_id = struct.unpack('>dddffB', packet.data[:33])
+
+                y = 320 # Teleport to a high altitude
+
+                new_data = struct.pack('>dddffB', x, y, z, yaw, pitch, flags) + packet.data[33:]
+
+                self.send_packet(Packet(0x36, new_data), self.client_socket)
+                return
+
             self.handle_game_packet(packet, direction)
 
         self.send_packet(packet, dest_socket)
@@ -340,38 +430,11 @@ class Connection:
                     chunk_x = int.from_bytes(data_io.read(4), 'big', signed=True)
                     chunk_z = int.from_bytes(data_io.read(4), 'big', signed=True)
 
-                    heightmaps = nbtlib.load(data_io)
+                    # For now, just print the raw NBT data to analyze it
+                    nbt_data = nbtlib.load(data_io)
+                    print(nbt_data.pretty())
 
-                    data_size = read_varint(data_io)
-
-                    chunk_section_data = data_io.read()
-
-                    output_dir = Path(self.args.output)
-                    region_dir = output_dir / "region"
-                    if not region_dir.exists():
-                        region_dir.mkdir(parents=True)
-
-                    region_x = chunk_x >> 5
-                    region_z = chunk_z >> 5
-
-                    region_file = RegionFile(region_dir / f"r.{region_x}.{region_z}.mca")
-
-                    chunk = Chunk(chunk_section_data)
-
-                    nbt_data = nbtlib.File({
-                        'Level': nbtlib.Compound({
-                            'xPos': nbtlib.Int(chunk_x),
-                            'zPos': nbtlib.Int(chunk_z),
-                            'Heightmaps': heightmaps.root[''],
-                            'Sections': chunk.sections,
-                        })
-                    }, byteorder='big')
-
-                    with io.BytesIO() as f:
-                        nbt_data.write(f)
-                        region_file.write_chunk(chunk_x, chunk_z, f.getvalue())
-
-                    print(f"Saved chunk {chunk_x}, {chunk_z} to r.{region_x}.{region_z}.mca")
+                    # The rest of the chunk saving logic will be re-implemented later
 
                 except Exception as e:
                     print(f"Error parsing chunk data: {e}")
@@ -398,8 +461,24 @@ def start_proxy(args):
         while True:
             client_socket, client_addr = server_socket.accept()
             print(f"Accepted connection from {client_addr}")
+
+            server_address = args.server
+            server_port = 25565
+
+            if not args.disable_srv_lookup:
+                try:
+                    answers = dns.resolver.resolve(f'_minecraft._tcp.{args.server}', 'SRV')
+                    if answers:
+                        answer = answers[0]
+                        server_address = str(answer.target)
+                        server_port = answer.port
+                except dns.resolver.NoAnswer:
+                    pass
+                except dns.resolver.NXDOMAIN:
+                    pass
+
             remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            remote_socket.connect((args.server, 25565))
+            remote_socket.connect((server_address, server_port))
 
             connection = Connection(client_socket, remote_socket, args)
 
@@ -424,6 +503,8 @@ def main():
     parser.add_argument("--local-port", "-l", type=int, default=25565, help="The port on which the world downloader's server will run.")
     parser.add_argument("--output", "-o", default="world", help="The world output directory.")
     parser.add_argument("--disable-chunk-saving", action="store_true", default=False, help="Disable writing chunks to disk.")
+    parser.add_argument("--disable-world-gen", action="store_true", default=False, help="Set world type to a superflat void.")
+    parser.add_argument("--disable-srv-lookup", action="store_true", default=False, help="Disable checking for true address using DNS service records.")
     parser.add_argument("--clear-settings", action="store_true", default=False, help="Clear settings by deleting the config.json file, then exit.")
 
     config_path = Path("cache/config.json")
